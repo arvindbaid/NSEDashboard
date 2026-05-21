@@ -385,7 +385,18 @@ def send_email(report_files):
             msg.attach(part)
 
     context = ssl.create_default_context()
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    # Auto-detect SMTP from email domain
+    smtp_servers = {
+        "gmail.com": ("smtp.gmail.com", 587),
+        "hotmail.com": ("smtp-mail.outlook.com", 587),
+        "outlook.com": ("smtp-mail.outlook.com", 587),
+        "live.com": ("smtp-mail.outlook.com", 587),
+        "yahoo.com": ("smtp.mail.yahoo.com", 587),
+    }
+    domain = SENDER_EMAIL.split("@")[-1].lower() if "@" in SENDER_EMAIL else ""
+    smtp_host, smtp_port = smtp_servers.get(domain, ("smtp-mail.outlook.com", 587))
+
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls(context=context)
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAILS, msg.as_string())
