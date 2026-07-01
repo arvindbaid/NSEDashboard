@@ -54,7 +54,7 @@ jobs:
       - name: Install dependencies
         run: |
           pip install --upgrade pip
-          pip install BharatFinTrack pandas numpy openpyxl xlsxwriter
+          pip install BharatFinTrack==0.3.0 pandas numpy openpyxl xlsxwriter
 
       # ── 4. Run report generator ──
       - name: Generate reports
