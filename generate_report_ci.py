@@ -56,11 +56,7 @@ log = logging.getLogger(__name__)
 # DATA LAYER
 # ──────────────────────────────────────────────
 def download_all_data():
-<<<<<<< HEAD
     """Download TRI data for all indices using new NSE API."""
-=======
-    """Download data from NSE. Run this LOCALLY, not on GitHub Actions."""
->>>>>>> d3e277ec71eee409e9c42a7c1ceb9e6812ab1fa6
     DATA_DIR.mkdir(exist_ok=True)
     product = NSEProduct()
 
@@ -500,13 +496,19 @@ if __name__ == "__main__":
 
     start = datetime.now()
 
-    # Step 1: Try downloading (will work locally, will fail on GitHub Actions)
-    if not any(DATA_DIR.glob("*.csv")):
-        log.info("Step 1/4: No cached data found. Attempting download...")
+    # Step 1: Always try fresh download (new API works without cookies)
+    log.info("Step 1/4: Downloading fresh data from NSE...")
+    try:
         download_all_data()
-    else:
-        csv_count = sum(1 for _ in DATA_DIR.glob("*.csv"))
-        log.info(f"Step 1/4: Using {csv_count} cached CSV files from data/ directory")
+    except Exception as e:
+        log.warning(f"Download failed: {e}")
+
+    # Check if we have data (either fresh or previously committed)
+    csv_count = sum(1 for _ in DATA_DIR.glob("*.csv"))
+    if csv_count == 0:
+        log.error("No data available. Run locally: python generate_report_ci.py --download-only")
+        sys.exit(1)
+    log.info(f"  Using {csv_count} CSV files")
 
     # Step 2: Generate reports
     log.info("Step 2/4: Generating Excel reports...")
