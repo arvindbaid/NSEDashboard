@@ -28,8 +28,25 @@ import json
 import urllib.request
 import urllib.parse
 
-from BharatFinTrack import NSEProduct
 from nse_data import download_all_indices as nse_download_all
+import json as json_lib
+
+
+def get_index_categories() -> dict:
+    """Load index categories — try BharatFinTrack first, fallback to JSON file."""
+    try:
+        from BharatFinTrack import NSEProduct
+        product = NSEProduct()
+        return {cat: product.equity_categorical_indices(cat) for cat in CATEGORIES}
+    except Exception:
+        pass
+    # Fallback: read from committed JSON
+    json_path = Path(__file__).parent / "index_categories.json"
+    if json_path.exists():
+        with open(json_path) as f:
+            return json_lib.load(f)
+    log.error("No index categories available — neither BharatFinTrack nor index_categories.json found!")
+    return {}
 
 # ──────────────────────────────────────────────
 # CONFIG
@@ -58,11 +75,11 @@ log = logging.getLogger(__name__)
 def download_all_data():
     """Download TRI data for all indices using new NSE API."""
     DATA_DIR.mkdir(exist_ok=True)
-    product = NSEProduct()
+    idx_by_cat = get_index_categories()
 
     all_indices = set()
     for cat in CATEGORIES:
-        all_indices.update(product.equity_categorical_indices(cat))
+        all_indices.update(idx_by_cat.get(cat, []))
     all_indices.add(BENCHMARK)
     all_indices = sorted(all_indices)
 
@@ -164,7 +181,7 @@ def calc_rolling_returns(nav_df, period_years):
 # ──────────────────────────────────────────────
 def generate_reports():
     REPORT_DIR.mkdir(exist_ok=True)
-    product = NSEProduct()
+    idx_by_cat = get_index_categories()
     report_date = datetime.now().strftime("%Y-%m-%d")
     report_month = datetime.now().strftime("%B %Y")
     report_files = []
@@ -183,7 +200,7 @@ def generate_reports():
     n50_periods = calc_period_returns(n50_nav) if n50_nav is not None else {}
 
     for cat in CATEGORIES:
-        indices = product.equity_categorical_indices(cat)
+        indices = idx_by_cat.get(cat, [])
         cat_label = CATEGORY_LABELS[cat]
         filepath = REPORT_DIR / f"{cat}_report_{report_date}.xlsx"
         log.info(f"Generating: {cat_label} ({len(indices)} indices)...")
@@ -295,7 +312,7 @@ def generate_reports():
     log.info("Generating summary report...")
     all_rows = []
     for cat in CATEGORIES:
-        indices = product.equity_categorical_indices(cat)
+        indices = idx_by_cat.get(cat, [])
         for idx in indices:
             nav = load_nav(idx)
             if nav is not None:
@@ -434,7 +451,7 @@ def telegram_api(method, data=None, files=None):
 
 def send_telegram(report_files):
     report_date = datetime.now().strftime("%d %b %Y")
-    product = NSEProduct()
+    idx_by_cat = get_index_categories()
 
     n50_nav = load_nav(BENCHMARK)
     n50_periods = calc_period_returns(n50_nav) if n50_nav is not None else {}
@@ -442,7 +459,7 @@ def send_telegram(report_files):
 
     performers = []
     for cat in CATEGORIES:
-        for idx in product.equity_categorical_indices(cat):
+        for idx in idx_by_cat.get(cat, []):
             nav = load_nav(idx)
             if nav is not None:
                 pr = calc_period_returns(nav)
