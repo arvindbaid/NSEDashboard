@@ -1,11 +1,14 @@
 """
 generate_report_ci.py — GitHub Actions compatible report generator
 ==================================================================
-Reads email credentials from environment variables (GitHub Secrets).
-Downloads NSE data, generates Excel reports, emails them.
+WORKFLOW:
+    1. Data is downloaded LOCALLY by the user and committed to the repo
+    2. GitHub Actions reads the committed CSV files, generates reports, and emails them
 
-This file is used by the GitHub Actions workflow.
-For local use, run monthly_report.py instead.
+    This avoids NSE blocking cloud/datacenter IPs.
+
+LOCAL DATA REFRESH (run before pushing):
+    python generate_report_ci.py --download-only
 """
 
 import pandas as pd
@@ -21,16 +24,22 @@ from email import encoders
 import logging
 import os
 import sys
+import json
+import urllib.request
+import urllib.parse
 
-from BharatFinTrack import NSETRI, NSEProduct
+from BharatFinTrack import NSEProduct
+from nse_data import download_all_indices as nse_download_all
 
 # ──────────────────────────────────────────────
-# CONFIG from environment variables
+# CONFIG
 # ──────────────────────────────────────────────
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 RECIPIENT_EMAILS = [e.strip() for e in os.environ.get("RECIPIENT_EMAILS", "").split(",") if e.strip()]
 SKIP_EMAIL = os.environ.get("SKIP_EMAIL", "false").lower() == "true"
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 
 CATEGORIES = ["broad", "sector", "thematic", "strategy"]
 CATEGORY_LABELS = {"broad": "Broad Based", "sector": "Sectoral", "thematic": "Thematic", "strategy": "Strategy"}
@@ -39,13 +48,7 @@ ROLLING_PERIODS = [1, 3, 5, 10]
 DATA_DIR = Path("data")
 REPORT_DIR = Path("reports")
 
-# ──────────────────────────────────────────────
-# LOGGING
-# ──────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 
@@ -53,28 +56,26 @@ log = logging.getLogger(__name__)
 # DATA LAYER
 # ──────────────────────────────────────────────
 def download_all_data():
+    """Download TRI data for all indices using new NSE API."""
     DATA_DIR.mkdir(exist_ok=True)
-    tri = NSETRI()
     product = NSEProduct()
 
     all_indices = set()
     for cat in CATEGORIES:
         all_indices.update(product.equity_categorical_indices(cat))
     all_indices.add(BENCHMARK)
+    all_indices = sorted(all_indices)
 
     log.info(f"Downloading {len(all_indices)} indices from NSE...")
-    failed = []
-    for i, idx in enumerate(sorted(all_indices)):
-        csv_path = DATA_DIR / f"{idx}.csv"
-        try:
-            tri.download_daily_data(index=idx, csv_file=str(csv_path))
-            if (i + 1) % 10 == 0:
-                log.info(f"  Progress: {i+1}/{len(all_indices)}")
-        except Exception as e:
-            log.warning(f"  ✗ {idx}: {e}")
-            failed.append(idx)
-
-    log.info(f"Download complete. {len(all_indices) - len(failed)} succeeded, {len(failed)} failed.")
+    succeeded, failed = nse_download_all(
+        indices=all_indices,
+        data_type="TRI",
+        data_dir=str(DATA_DIR),
+    )
+    log.info(f"Download complete. {succeeded} succeeded, {len(failed)} failed.")
+    if failed:
+        for name, err in failed:
+            log.warning(f"  ✗ {name}: {err}")
     return failed
 
 
@@ -159,7 +160,7 @@ def calc_rolling_returns(nav_df, period_years):
 
 
 # ──────────────────────────────────────────────
-# EXCEL REPORT GENERATION
+# REPORT GENERATION
 # ──────────────────────────────────────────────
 def generate_reports():
     REPORT_DIR.mkdir(exist_ok=True)
@@ -167,6 +168,16 @@ def generate_reports():
     report_date = datetime.now().strftime("%Y-%m-%d")
     report_month = datetime.now().strftime("%B %Y")
     report_files = []
+
+    # Check how many indices have data
+    available = sum(1 for f in DATA_DIR.glob("*.csv") if f.stat().st_size > 100)
+    if available == 0:
+        log.error("No CSV data files found in data/ directory!")
+        log.error("Run locally first: python generate_report_ci.py --download-only")
+        log.error("Then: git add data/ && git commit -m 'Add index data' && git push")
+        return []
+
+    log.info(f"Found {available} index data files in data/")
 
     n50_nav = load_nav(BENCHMARK)
     n50_periods = calc_period_returns(n50_nav) if n50_nav is not None else {}
@@ -192,13 +203,12 @@ def generate_reports():
                     ws.write(2, c, col_name, hdr)
                 ws.set_column(0, 0, 38)
                 ws.set_column(1, len(df.columns) - 1, 13)
-                # Green/red conditional formatting on numeric columns
                 for c in range(1, len(df.columns)):
                     if df.dtypes.iloc[c] in [np.float64, np.int64, float, int]:
                         ws.conditional_format(3, c, len(df) + 2, c, {"type": "cell", "criteria": ">=", "value": 0, "format": pos})
                         ws.conditional_format(3, c, len(df) + 2, c, {"type": "cell", "criteria": "<", "value": 0, "format": neg})
 
-            # Sheet: Yearly Returns
+            # Yearly
             rows = []
             for idx in indices:
                 nav = load_nav(idx)
@@ -215,7 +225,7 @@ def generate_reports():
                 df = df[["Index"] + year_cols + ["Avg"]]
                 write_sheet(df, "Yearly Returns", f"{cat_label} — Calendar Year Returns (%) | {report_month}")
 
-            # Sheet: Monthly Returns
+            # Monthly
             rows = []
             m_labels = None
             for idx in indices:
@@ -234,7 +244,7 @@ def generate_reports():
                 df = pd.DataFrame(rows).sort_values("12M Cum.", ascending=False)
                 write_sheet(df, "Monthly Returns", f"{cat_label} — Last 12 Months (%) | {report_month}")
 
-            # Sheets: Rolling Returns
+            # Rolling
             for period in ROLLING_PERIODS:
                 rows = []
                 for idx in indices:
@@ -251,7 +261,7 @@ def generate_reports():
                     df = pd.DataFrame(rows).sort_values("Average (%)", ascending=False)
                     write_sheet(df, f"Rolling {period}Y", f"{cat_label} — {period}Y Rolling CAGR (%) | {report_month}")
 
-            # Sheet: vs NIFTY 50
+            # vs NIFTY 50
             comp_periods = ["1M", "3M", "6M", "9M", "1Y"]
             rows = []
             for idx in indices:
@@ -280,7 +290,7 @@ def generate_reports():
         report_files.append(filepath)
         log.info(f"  ✓ {filepath.name}")
 
-    # Summary report
+    # Summary
     summary_path = REPORT_DIR / f"summary_report_{report_date}.xlsx"
     log.info("Generating summary report...")
     all_rows = []
@@ -307,7 +317,7 @@ def generate_reports():
             neg_f = wb.add_format({"font_color": "#dc2626", "num_format": "+0.00;-0.00", "bold": True})
             ttl = wb.add_format({"bold": True, "font_size": 14, "font_color": "#0ea5e9"})
 
-            for sheet_name, df_sheet, ascending in [
+            for sheet_name, df_sheet, _ in [
                 ("Top 25 Outperformers", df_all.sort_values("1Y Excess", ascending=False).head(25), False),
                 ("Bottom 25 Laggards", df_all.sort_values("1Y Excess", ascending=True).head(25), True),
             ]:
@@ -324,8 +334,11 @@ def generate_reports():
                         ws.conditional_format(3, c, len(df_sheet) + 2, c, {"type": "cell", "criteria": ">=", "value": 0, "format": pos_f})
                         ws.conditional_format(3, c, len(df_sheet) + 2, c, {"type": "cell", "criteria": "<", "value": 0, "format": neg_f})
 
-    report_files.append(summary_path)
-    log.info(f"  ✓ {summary_path.name}")
+        report_files.append(summary_path)
+        log.info(f"  ✓ {summary_path.name}")
+    else:
+        log.warning("  No data for summary report — skipped")
+
     return report_files
 
 
@@ -342,8 +355,7 @@ def send_email(report_files):
     msg["Subject"] = f"NSE Index Monthly Report — {report_month}"
 
     body = f"""
-    <html>
-    <body style="font-family: 'Segoe UI', Arial, sans-serif; color: #334155; line-height: 1.6;">
+    <html><body style="font-family: 'Segoe UI', Arial, sans-serif; color: #334155; line-height: 1.6;">
     <div style="max-width: 600px; margin: 0 auto;">
         <div style="background: linear-gradient(135deg, #0ea5e9, #8b5cf6); padding: 20px 24px; border-radius: 12px 12px 0 0;">
             <h1 style="color: #fff; margin: 0; font-size: 22px;">₹ NSE Index Monthly Report</h1>
@@ -351,32 +363,23 @@ def send_email(report_files):
         </div>
         <div style="background: #f8fafc; padding: 20px 24px; border: 1px solid #e2e8f0; border-top: none; border-radius: 0 0 12px 12px;">
             <p>Your monthly NSE index analysis reports are attached.</p>
-            <h3 style="color: #0ea5e9;">📎 Attached Reports:</h3>
+            <h3 style="color: #0ea5e9;">📎 Reports:</h3>
             <ul style="list-style: none; padding: 0;">
     """
     for f in report_files:
         body += f'<li style="padding: 4px 0;">📊 <strong>{f.name}</strong></li>\n'
     body += """
             </ul>
-            <h3 style="color: #0ea5e9;">📋 Contents:</h3>
-            <ul>
-                <li><strong>Yearly Returns</strong> — Calendar year returns since inception</li>
-                <li><strong>Monthly Returns</strong> — Trailing 12 months with hit rate</li>
-                <li><strong>Rolling Returns</strong> — 1Y/3Y/5Y/10Y CAGR with probability of positive returns</li>
-                <li><strong>vs NIFTY 50</strong> — Excess returns across 1M to 1Y</li>
-                <li><strong>Summary</strong> — Top 25 outperformers & Bottom 25 laggards</li>
-            </ul>
-            <p style="font-size: 12px; color: #94a3b8; margin-top: 20px; border-top: 1px solid #e2e8f0; padding-top: 12px;">
-                Data: NSE India TRI via BharatFinTrack<br>
-                Generated via GitHub Actions on {report_date}
-            </p>
+            <p style="font-size: 12px; color: #94a3b8; margin-top: 16px; border-top: 1px solid #e2e8f0; padding-top: 12px;">
+                Data: NSE India TRI via BharatFinTrack | Generated via GitHub Actions</p>
         </div>
-    </div>
-    </body></html>
+    </div></body></html>
     """
     msg.attach(MIMEText(body, "html"))
 
     for fp in report_files:
+        if not fp.exists():
+            continue
         with open(fp, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
@@ -384,12 +387,96 @@ def send_email(report_files):
             part.add_header("Content-Disposition", f"attachment; filename={fp.name}")
             msg.attach(part)
 
+    # Auto-detect SMTP
+    smtp_servers = {
+        "gmail.com": ("smtp.gmail.com", 587),
+        "hotmail.com": ("smtp-mail.outlook.com", 587),
+        "outlook.com": ("smtp-mail.outlook.com", 587),
+        "live.com": ("smtp-mail.outlook.com", 587),
+        "yahoo.com": ("smtp.mail.yahoo.com", 587),
+    }
+    domain = SENDER_EMAIL.split("@")[-1].lower() if "@" in SENDER_EMAIL else ""
+    smtp_host, smtp_port = smtp_servers.get(domain, ("smtp-mail.outlook.com", 587))
+
     context = ssl.create_default_context()
-    with smtplib.SMTP("smtp.gmail.com", 587) as server:
+    with smtplib.SMTP(smtp_host, smtp_port) as server:
         server.starttls(context=context)
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAILS, msg.as_string())
     log.info(f"✓ Email sent to: {', '.join(RECIPIENT_EMAILS)}")
+
+
+# ──────────────────────────────────────────────
+# TELEGRAM
+# ──────────────────────────────────────────────
+def telegram_api(method, data=None, files=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    if files:
+        boundary = "----TgBoundary"
+        body = b""
+        if data:
+            for key, val in data.items():
+                body += f"--{boundary}\r\n".encode()
+                body += f"Content-Disposition: form-data; name=\"{key}\"\r\n\r\n{val}\r\n".encode()
+        for field, (fname, fbytes, ctype) in files.items():
+            body += f"--{boundary}\r\n".encode()
+            body += f"Content-Disposition: form-data; name=\"{field}\"; filename=\"{fname}\"\r\nContent-Type: {ctype}\r\n\r\n".encode()
+            body += fbytes + b"\r\n"
+        body += f"--{boundary}--\r\n".encode()
+        req = urllib.request.Request(url, data=body)
+        req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    else:
+        body = json.dumps(data or {}).encode()
+        req = urllib.request.Request(url, data=body)
+        req.add_header("Content-Type", "application/json")
+    return json.loads(urllib.request.urlopen(req, timeout=30).read().decode())
+
+
+def send_telegram(report_files):
+    report_date = datetime.now().strftime("%d %b %Y")
+    product = NSEProduct()
+
+    n50_nav = load_nav(BENCHMARK)
+    n50_periods = calc_period_returns(n50_nav) if n50_nav is not None else {}
+    n50_1y = n50_periods.get("1Y", 0)
+
+    performers = []
+    for cat in CATEGORIES:
+        for idx in product.equity_categorical_indices(cat):
+            nav = load_nav(idx)
+            if nav is not None:
+                pr = calc_period_returns(nav)
+                own = pr.get("1Y")
+                if own is not None:
+                    performers.append({"name": idx, "cat": CATEGORY_LABELS[cat], "1y": own, "excess": round(own - n50_1y, 2)})
+
+    performers.sort(key=lambda x: x["excess"], reverse=True)
+    outperformers = sum(1 for p in performers if p["excess"] > 0)
+
+    msg = f"📊 *NSE Index Monthly Report*\n📅 {report_date}\n\n"
+    msg += f"*NIFTY 50 (1Y):* {n50_1y:+.2f}%\n*Outperformers:* {outperformers}/{len(performers)}\n\n"
+    msg += "🏆 *Top 5 (1Y)*\n"
+    for i, p in enumerate(performers[:5], 1):
+        msg += f"{i}. *{p['name']}* {p['1y']:+.1f}% (_{p['cat']}_)\n"
+    msg += "\n📉 *Bottom 5 (1Y)*\n"
+    for i, p in enumerate(performers[-5:], 1):
+        msg += f"{i}. *{p['name']}* {p['1y']:+.1f}% (_{p['cat']}_)\n"
+    msg += f"\n📎 {len(report_files)} reports attached below"
+
+    telegram_api("sendMessage", {"chat_id": TELEGRAM_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+    log.info("✓ Telegram summary sent")
+
+    for fp in report_files:
+        if not fp.exists():
+            continue
+        try:
+            with open(fp, "rb") as f:
+                telegram_api("sendDocument",
+                    data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"📊 {fp.name}"},
+                    files={"document": (fp.name, f.read(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")})
+            log.info(f"  ✓ Sent: {fp.name}")
+        except Exception as e:
+            log.warning(f"  ✗ {fp.name}: {e}")
 
 
 # ──────────────────────────────────────────────
@@ -400,26 +487,53 @@ if __name__ == "__main__":
     log.info(f"NSE MONTHLY REPORT — {datetime.now().strftime('%d %b %Y %H:%M')}")
     log.info("=" * 60)
 
+    # Handle --download-only flag for local use
+    if "--download-only" in sys.argv:
+        log.info("MODE: Download only (run this locally)")
+        download_all_data()
+        log.info("Done! Now commit and push: git add data/ && git commit -m 'Update data' && git push")
+        sys.exit(0)
+
     start = datetime.now()
 
-    # Step 1: Download
-    log.info("Step 1/3: Downloading TRI data from NSE...")
-    download_all_data()
+    # Step 1: Try downloading (will work locally, will fail on GitHub Actions)
+    if not any(DATA_DIR.glob("*.csv")):
+        log.info("Step 1/4: No cached data found. Attempting download...")
+        download_all_data()
+    else:
+        csv_count = sum(1 for _ in DATA_DIR.glob("*.csv"))
+        log.info(f"Step 1/4: Using {csv_count} cached CSV files from data/ directory")
 
-    # Step 2: Generate
-    log.info("Step 2/3: Generating Excel reports...")
+    # Step 2: Generate reports
+    log.info("Step 2/4: Generating Excel reports...")
     files = generate_reports()
+    if not files:
+        log.error("No reports generated. Exiting.")
+        sys.exit(1)
     log.info(f"Generated {len(files)} reports")
 
-    # Step 3: Email (unless skipped)
+    # Step 3: Email
     if SKIP_EMAIL:
-        log.info("Step 3/3: Email SKIPPED (--skip-email flag)")
+        log.info("Step 3/4: Email SKIPPED")
     elif not SENDER_EMAIL or not SENDER_PASSWORD or not RECIPIENT_EMAILS:
-        log.warning("Step 3/3: Email SKIPPED — credentials not configured in GitHub Secrets")
-        log.warning("  Add SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAILS to repo Settings → Secrets")
+        log.info("Step 3/4: Email SKIPPED — no credentials configured")
     else:
-        log.info("Step 3/3: Sending email...")
-        send_email(files)
+        log.info("Step 3/4: Sending email...")
+        try:
+            send_email(files)
+        except Exception as e:
+            log.error(f"Email failed: {e}")
+            log.error("Reports still saved — check artifacts")
+
+    # Step 4: Telegram
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.info("Step 4/4: Telegram SKIPPED — not configured")
+    else:
+        log.info("Step 4/4: Sending to Telegram...")
+        try:
+            send_telegram(files)
+        except Exception as e:
+            log.error(f"Telegram failed: {e}")
 
     elapsed = (datetime.now() - start).total_seconds()
     log.info(f"✓ DONE in {elapsed:.0f}s")
