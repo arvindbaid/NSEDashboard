@@ -28,12 +28,12 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.x"
+          python-version: "3.12"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install BharatFinTrack==0.3.0 pandas numpy openpyxl xlsxwriter requests
+          pip install BharatFinTrack pandas numpy openpyxl xlsxwriter requests
 
       - name: Download fresh data & generate reports
         env:
