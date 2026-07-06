@@ -56,7 +56,11 @@ log = logging.getLogger(__name__)
 # DATA LAYER
 # ──────────────────────────────────────────────
 def download_all_data():
+<<<<<<< HEAD
     """Download TRI data for all indices using new NSE API."""
+=======
+    """Download data from NSE. Run this LOCALLY, not on GitHub Actions."""
+>>>>>>> d3e277ec71eee409e9c42a7c1ceb9e6812ab1fa6
     DATA_DIR.mkdir(exist_ok=True)
     product = NSEProduct()
 
