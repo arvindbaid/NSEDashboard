@@ -1,31 +1,10 @@
-# .github/workflows/monthly_report.yml
-# ─────────────────────────────────────────────────
-# NSE Index Monthly Report — GitHub Actions Workflow
-# ─────────────────────────────────────────────────
-# Runs on 1st of every month at 8:00 AM IST (2:30 AM UTC)
-# Downloads live NSE data, generates Excel reports, emails them
-#
-# SETUP:
-#   1. Push this repo to GitHub
-#   2. Go to repo Settings → Secrets and variables → Actions
-#   3. Add these Repository Secrets:
-#      - SENDER_EMAIL       → your Gmail address
-#      - SENDER_PASSWORD    → Gmail App Password (NOT regular password)
-#      - RECIPIENT_EMAILS   → comma-separated: user1@email.com,user2@email.com
-#   4. Done! It runs automatically on the 1st of every month
-#
-# TO TEST MANUALLY:
-#   Go to Actions tab → "NSE Monthly Report" → "Run workflow" button
-# ─────────────────────────────────────────────────
-
 name: NSE Monthly Report
 
 on:
-  # Scheduled: 1st of every month at 2:30 AM UTC = 8:00 AM IST
   schedule:
+    # 1st of every month at 2:30 AM UTC = 8:00 AM IST
     - cron: "30 2 1 * *"
 
-  # Manual trigger from GitHub Actions tab
   workflow_dispatch:
     inputs:
       skip_email:
@@ -33,51 +12,50 @@ on:
         required: false
         default: "false"
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
 jobs:
   generate-and-email:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
-      # ── 1. Checkout repo ──
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Setup Python ──
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-          cache: "pip"
+          python-version: "3.x"
 
-      # ── 3. Install dependencies ──
       - name: Install dependencies
         run: |
-          pip install --upgrade pip
-          pip install BharatFinTrack==0.3.0 pandas numpy openpyxl xlsxwriter
+          python -m pip install --upgrade pip
+          pip install BharatFinTrack==0.3.0 pandas numpy openpyxl xlsxwriter requests
 
-      # ── 4. Run report generator ──
-      - name: Generate reports
+      - name: Download fresh data & generate reports
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAILS: ${{ secrets.RECIPIENT_EMAILS }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           SKIP_EMAIL: ${{ github.event.inputs.skip_email || 'false' }}
         run: python generate_report_ci.py
 
-      # ── 5. Upload reports as artifacts (downloadable from GitHub) ──
       - name: Upload reports as artifacts
         uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: nse-reports-${{ github.run_number }}
           path: reports/*.xlsx
           retention-days: 90
 
-      # ── 6. Commit reports to repo (optional — keeps history) ──
-      - name: Commit reports to repo
+      - name: Commit updated data & reports
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add reports/*.xlsx || true
-          git diff --staged --quiet || git commit -m "📊 Monthly report — $(date +'%B %Y')"
+          git add data/*.csv reports/*.xlsx || true
+          git diff --staged --quiet || git commit -m "📊 Monthly report + data update — $(date +'%B %Y')"
           git push || true
